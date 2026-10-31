@@ -1,0 +1,370 @@
+--// FRONT HUB V2 - Boîte à outils UI (thème noir & vert néon, style hacker)
+
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+
+local UI = {}
+
+UI.animations = true
+UI.accent = Color3.fromRGB(57, 255, 20)
+UI.colors = {
+	bg = Color3.fromRGB(4, 7, 4),
+	panel = Color3.fromRGB(10, 15, 10),
+	item = Color3.fromRGB(17, 26, 17),
+	text = Color3.fromRGB(205, 255, 215),
+	dim = Color3.fromRGB(105, 150, 115),
+	good = Color3.fromRGB(57, 255, 20),
+	bad = Color3.fromRGB(255, 70, 90),
+	warn = Color3.fromRGB(255, 200, 60),
+}
+UI.font = Enum.Font.Code
+UI.fontBold = Enum.Font.GothamBold
+UI.fontTitle = Enum.Font.GothamBlack
+
+local accentTargets, buttons, glows, accentCallbacks = {}, {}, {}, {}
+local orderCounters = setmetatable({}, { __mode = "k" })
+
+----------------------------------------------------------------------
+-- Bases
+----------------------------------------------------------------------
+function UI.hex(c)
+	return string.format("#%02X%02X%02X", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+
+function UI.tween(obj, t, props, style, dir)
+	if not UI.animations or t <= 0 then
+		for k, v in pairs(props) do
+			obj[k] = v
+		end
+		return nil
+	end
+	local tw = TweenService:Create(obj, TweenInfo.new(t, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), props)
+	tw:Play()
+	return tw
+end
+
+function UI.new(class, props)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do
+		if k ~= "Parent" then
+			o[k] = v
+		end
+	end
+	if props.Parent then
+		o.Parent = props.Parent
+	end
+	return o
+end
+
+function UI.corner(obj, radius)
+	return UI.new("UICorner", { CornerRadius = UDim.new(0, radius), Parent = obj })
+end
+
+function UI.rawStroke(obj, color, thickness, transparency)
+	return UI.new("UIStroke", {
+		Color = color,
+		Thickness = thickness or 1,
+		Transparency = transparency or 0,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Parent = obj,
+	})
+end
+
+function UI.fmt(n)
+	n = n or 0
+	local sign = n < 0 and "-" or ""
+	n = math.abs(n)
+	local suffixes = { "", "K", "M", "B", "T", "Qa" }
+	local i = 1
+	while n >= 1000 and i < #suffixes do
+		n /= 1000
+		i += 1
+	end
+	if i == 1 then
+		return sign .. tostring(math.floor(n))
+	end
+	local s = string.format("%.2f", n)
+	s = s:gsub("%.?0+$", "")
+	return sign .. s .. suffixes[i]
+end
+
+function UI.fmtTime(seconds)
+	seconds = math.floor(seconds or 0)
+	return string.format("%02d:%02d:%02d", math.floor(seconds / 3600), math.floor(seconds / 60) % 60, seconds % 60)
+end
+
+----------------------------------------------------------------------
+-- Couleur d'accent (changeable dans les réglages)
+----------------------------------------------------------------------
+function UI.accentize(inst, prop)
+	inst[prop] = UI.accent
+	accentTargets[#accentTargets + 1] = { inst = inst, prop = prop }
+end
+
+function UI.onAccent(fn)
+	accentCallbacks[#accentCallbacks + 1] = fn
+	fn(UI.accent)
+end
+
+function UI.glow(stroke)
+	glows[#glows + 1] = stroke
+end
+
+function UI.stroke(obj, thickness)
+	local s = UI.rawStroke(obj, UI.accent, thickness or 1.2, 0)
+	UI.accentize(s, "Color")
+	return s
+end
+
+local function paint(b)
+	local on = b:GetAttribute("On")
+	local hover = b:GetAttribute("Hover")
+	local transparency
+	if on then
+		transparency = hover and 0.15 or 0
+	else
+		transparency = hover and 0.7 or 0.88
+	end
+	UI.tween(b, 0.12, {
+		BackgroundTransparency = transparency,
+		BackgroundColor3 = UI.accent,
+		TextColor3 = on and UI.colors.bg or UI.accent,
+	})
+end
+
+function UI.setAccent(color)
+	UI.accent = color
+	for i = #accentTargets, 1, -1 do
+		local t = accentTargets[i]
+		if t.inst.Parent == nil then
+			table.remove(accentTargets, i)
+		else
+			UI.tween(t.inst, 0.25, { [t.prop] = color })
+		end
+	end
+	for i = #buttons, 1, -1 do
+		local b = buttons[i]
+		if b.Parent == nil then
+			table.remove(buttons, i)
+		else
+			paint(b)
+		end
+	end
+	for _, fn in ipairs(accentCallbacks) do
+		fn(color)
+	end
+end
+
+-- Pulsation des contours lumineux
+RunService.Heartbeat:Connect(function()
+	local t = os.clock()
+	for i = #glows, 1, -1 do
+		local s = glows[i]
+		if s.Parent == nil then
+			table.remove(glows, i)
+		elseif UI.animations then
+			s.Transparency = 0.1 + 0.35 * (math.sin(t * 2.2 + i) * 0.5 + 0.5)
+		else
+			s.Transparency = 0.25
+		end
+	end
+end)
+
+----------------------------------------------------------------------
+-- Composants
+----------------------------------------------------------------------
+function UI.label(parent, text, props)
+	props = props or {}
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.BorderSizePixel = 0
+	l.Text = text
+	l.RichText = true
+	l.TextWrapped = true
+	l.Font = props.Font or UI.font
+	l.TextSize = props.TextSize or 14
+	l.TextColor3 = props.TextColor3 or UI.colors.text
+	l.TextXAlignment = props.TextXAlignment or Enum.TextXAlignment.Left
+	l.TextYAlignment = props.TextYAlignment or Enum.TextYAlignment.Top
+	l.Position = props.Position or UDim2.new()
+	l.Size = props.Size or UDim2.new(1, 0, 0, 18)
+	if props.LayoutOrder then l.LayoutOrder = props.LayoutOrder end
+	l.Parent = parent
+	return l
+end
+
+function UI.button(parent, text, props)
+	props = props or {}
+	local b = Instance.new("TextButton")
+	b.AutoButtonColor = false
+	b.BorderSizePixel = 0
+	b.Text = text
+	b.Font = props.Font or UI.font
+	b.TextSize = props.TextSize or 14
+	b.Size = props.Size or UDim2.new(1, 0, 0, 34)
+	b.Position = props.Position or UDim2.new()
+	b.BackgroundColor3 = UI.accent
+	b.BackgroundTransparency = 0.88
+	b.TextColor3 = UI.accent
+	if props.LayoutOrder then b.LayoutOrder = props.LayoutOrder end
+	b.Parent = parent
+	UI.corner(b, 6)
+	UI.glow(UI.stroke(b, 1.2))
+
+	local scale = Instance.new("UIScale")
+	scale.Parent = b
+	b:SetAttribute("On", false)
+	b:SetAttribute("Hover", false)
+	buttons[#buttons + 1] = b
+
+	b.MouseEnter:Connect(function()
+		b:SetAttribute("Hover", true)
+		paint(b)
+	end)
+	b.MouseLeave:Connect(function()
+		b:SetAttribute("Hover", false)
+		paint(b)
+		UI.tween(scale, 0.1, { Scale = 1 })
+	end)
+	b.MouseButton1Down:Connect(function()
+		UI.tween(scale, 0.08, { Scale = 0.95 })
+	end)
+	b.MouseButton1Up:Connect(function()
+		UI.tween(scale, 0.12, { Scale = 1 }, Enum.EasingStyle.Back)
+		if UIS.TouchEnabled then
+			b:SetAttribute("Hover", false)
+			paint(b)
+		end
+	end)
+	return b
+end
+
+function UI.setOn(b, on, textOn, textOff)
+	b:SetAttribute("On", on and true or false)
+	if on and textOn then
+		b.Text = textOn
+	elseif not on and textOff then
+		b.Text = textOff
+	end
+	paint(b)
+end
+
+function UI.bar(parent, props)
+	local back = Instance.new("Frame")
+	back.BackgroundColor3 = UI.colors.item
+	back.BorderSizePixel = 0
+	back.Size = props.Size or UDim2.new(1, 0, 0, 8)
+	back.Position = props.Position or UDim2.new()
+	back.Parent = parent
+	UI.corner(back, 4)
+
+	local fill = Instance.new("Frame")
+	fill.BorderSizePixel = 0
+	fill.Size = UDim2.new(0, 0, 1, 0)
+	fill.Parent = back
+	UI.corner(fill, 4)
+	UI.accentize(fill, "BackgroundColor3")
+
+	local api = { Frame = back, Fill = fill }
+	function api.Set(fraction)
+		fraction = math.clamp(fraction or 0, 0, 1)
+		UI.tween(fill, 0.25, { Size = UDim2.new(fraction, 0, 1, 0) })
+	end
+	return api
+end
+
+function UI.input(parent, props)
+	local box = Instance.new("TextBox")
+	box.BackgroundColor3 = UI.colors.item
+	box.BorderSizePixel = 0
+	box.Text = ""
+	box.PlaceholderText = props.Placeholder or ""
+	box.PlaceholderColor3 = UI.colors.dim
+	box.TextColor3 = UI.colors.text
+	box.Font = UI.font
+	box.TextSize = props.TextSize or 13
+	box.ClearTextOnFocus = false
+	box.TextXAlignment = Enum.TextXAlignment.Left
+	box.TextTruncate = Enum.TextTruncate.AtEnd
+	box.Size = props.Size or UDim2.new(1, 0, 0, 34)
+	box.Position = props.Position or UDim2.new()
+	box.Parent = parent
+	UI.corner(box, 6)
+	UI.new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10), Parent = box })
+	local stroke = UI.rawStroke(box, UI.colors.dim, 1.2, 0.4)
+	box.Focused:Connect(function()
+		UI.tween(stroke, 0.15, { Color = UI.accent, Transparency = 0 })
+	end)
+	box.FocusLost:Connect(function()
+		UI.tween(stroke, 0.15, { Color = UI.colors.dim, Transparency = 0.4 })
+	end)
+	return box
+end
+
+function UI.card(scroll, height)
+	orderCounters[scroll] = (orderCounters[scroll] or 0) + 1
+	local f = Instance.new("Frame")
+	f.Size = UDim2.new(1, 0, 0, height)
+	f.BackgroundColor3 = UI.colors.panel
+	f.BorderSizePixel = 0
+	f.LayoutOrder = orderCounters[scroll]
+	f.Parent = scroll
+	UI.corner(f, 8)
+	UI.rawStroke(f, UI.colors.dim, 1, 0.6)
+	return f
+end
+
+-- Une page = CanvasGroup (pour le fondu) contenant un ScrollingFrame
+function UI.page(parent)
+	local group = Instance.new("CanvasGroup")
+	group.BackgroundTransparency = 1
+	group.BorderSizePixel = 0
+	group.Size = UDim2.new(1, 0, 1, 0)
+	group.Visible = false
+	group.GroupTransparency = 1
+	group.Parent = parent
+
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.BackgroundTransparency = 1
+	scroll.BorderSizePixel = 0
+	scroll.Size = UDim2.new(1, 0, 1, 0)
+	scroll.ScrollBarThickness = 3
+	scroll.CanvasSize = UDim2.new()
+	scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+	scroll.Parent = group
+	UI.accentize(scroll, "ScrollBarImageColor3")
+
+	UI.new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = scroll })
+	UI.new("UIPadding", { PaddingRight = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8), Parent = scroll })
+	return group, scroll
+end
+
+-- Ligne "légende  [-]  valeur  [+]"
+function UI.stepper(card, y, caption, valueText, onMinus, onPlus)
+	UI.label(card, caption, { Position = UDim2.new(0, 14, 0, y + 8), Size = UDim2.new(1, -200, 0, 18), TextSize = 13 })
+	local minus = UI.button(card, "-", { Position = UDim2.new(1, -158, 0, y), Size = UDim2.new(0, 36, 0, 32), TextSize = 20 })
+	local value = UI.label(card, valueText, {
+		Position = UDim2.new(1, -118, 0, y), Size = UDim2.new(0, 66, 0, 32), TextSize = 15,
+		Font = UI.fontBold, TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
+	})
+	UI.accentize(value, "TextColor3")
+	local plus = UI.button(card, "+", { Position = UDim2.new(1, -48, 0, y), Size = UDim2.new(0, 36, 0, 32), TextSize = 20 })
+	minus.MouseButton1Click:Connect(onMinus)
+	plus.MouseButton1Click:Connect(onPlus)
+	return value
+end
+
+-- Ligne "légende  [ON/OFF]"
+function UI.toggle(card, y, caption, on, onClick)
+	UI.label(card, caption, { Position = UDim2.new(0, 14, 0, y + 8), Size = UDim2.new(1, -140, 0, 18), TextSize = 13 })
+	local b = UI.button(card, on and "ON" or "OFF", { Position = UDim2.new(1, -110, 0, y), Size = UDim2.new(0, 96, 0, 32) })
+	UI.setOn(b, on, "ON", "OFF")
+	b.MouseButton1Click:Connect(function()
+		onClick(b)
+	end)
+	return b
+end
+
+return UI
