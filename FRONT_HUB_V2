@@ -1,3 +1,47 @@
+--// ==========================================================================
+--//  FRONT HUB V2  (version executor / loadstring)
+--//  Interface noir & vert neon : Main, Movement, Teleport, Builder, Player, Settings
+--//  Tout est LOCAL (client) : seul toi vois ce que fait ce menu.
+--//  Lance avec : loadstring(game:HttpGet("TON_LIEN_RAW"))()
+--// ==========================================================================
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local StatsService = game:GetService("Stats")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local player = Players.LocalPlayer
+local env = (getgenv and getgenv()) or _G
+
+-- Si le hub est deja lance, on supprime l'ancienne version proprement
+if env.FrontHubV2Cleanup then
+	pcall(env.FrontHubV2Cleanup)
+end
+
+local function getParent()
+	local ok, gui = pcall(function()
+		return (gethui and gethui()) or game:GetService("CoreGui")
+	end)
+	if ok and gui then return gui end
+	return player:WaitForChild("PlayerGui")
+end
+local parentGui = getParent()
+local oldGui = parentGui:FindFirstChild("FrontHubV2")
+if oldGui then oldGui:Destroy() end
+
+local conns = {}
+local function bind(signal, fn)
+	local cn = signal:Connect(fn)
+	conns[#conns + 1] = cn
+	return cn
+end
+
+----------------------------------------------------------------------
+-- BOITE A OUTILS UI
+----------------------------------------------------------------------
+local UI = (function()
 --// FRONT HUB V2 - Boîte à outils UI (thème noir & vert néon, style hacker)
 
 local TweenService = game:GetService("TweenService")
@@ -157,7 +201,7 @@ function UI.setAccent(color)
 end
 
 -- Pulsation des contours lumineux
-RunService.Heartbeat:Connect(function()
+UI._hb = RunService.Heartbeat:Connect(function()
 	local t = os.clock()
 	for i = #glows, 1, -1 do
 		local s = glows[i]
@@ -367,4 +411,1456 @@ function UI.toggle(card, y, caption, on, onClick)
 	return b
 end
 
+
+function UI.Destroy()
+	if UI._hb then UI._hb:Disconnect() UI._hb = nil end
+end
+
 return UI
+
+end)()
+
+----------------------------------------------------------------------
+-- DECODEUR PNG (pour le Builder)
+----------------------------------------------------------------------
+local PNGDecoder = (function()
+--// FRONT HUB V2 - Décodeur PNG en Luau pur (inflate + filtres)
+--// Supporte PNG 8 bits non entrelacés (gris, RGB, palette, gris+alpha, RGBA).
+
+local PNGDecoder = {}
+
+local PNG_SIG = "\137PNG\r\n\26\n"
+
+local LBASE = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 }
+local LEXT = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 }
+local DBASE = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 }
+local DEXT = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 }
+local CLORDER = { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 }
+
+local function buildHuff(lengths, n)
+	local count = {}
+	for i = 0, 15 do count[i] = 0 end
+	for i = 0, n - 1 do count[lengths[i]] += 1 end
+	local offs = { [1] = 0 }
+	for i = 1, 14 do offs[i + 1] = offs[i] + count[i] end
+	local symbol = {}
+	for i = 0, n - 1 do
+		local l = lengths[i]
+		if l ~= 0 then
+			symbol[offs[l]] = i
+			offs[l] += 1
+		end
+	end
+	return { count = count, symbol = symbol }
+end
+
+local function inflate(data, pos)
+	local out, outn = {}, 0
+	local bitbuf, bitcnt = 0, 0
+
+	local function getbits(n)
+		if n == 0 then return 0 end
+		while bitcnt < n do
+			local b = string.byte(data, pos)
+			pos += 1
+			bitbuf = bit32.bor(bitbuf, bit32.lshift(b, bitcnt))
+			bitcnt += 8
+		end
+		local v = bit32.band(bitbuf, bit32.lshift(1, n) - 1)
+		bitbuf = bit32.rshift(bitbuf, n)
+		bitcnt -= n
+		return v
+	end
+
+	local function decode(h)
+		local code, first, index = 0, 0, 0
+		for len = 1, 15 do
+			code = bit32.bor(code, getbits(1))
+			local cnt = h.count[len]
+			if code - cnt < first then
+				return h.symbol[index + (code - first)]
+			end
+			index += cnt
+			first = (first + cnt) * 2
+			code = code * 2
+		end
+		error("Code Huffman invalide")
+	end
+
+	local fixedLit, fixedDist
+	repeat
+		local final = getbits(1)
+		local typ = getbits(2)
+		if typ == 0 then
+			bitbuf, bitcnt = 0, 0
+			local len = string.byte(data, pos) + string.byte(data, pos + 1) * 256
+			pos += 4
+			for i = 0, len - 1 do
+				outn += 1
+				out[outn] = string.byte(data, pos + i)
+			end
+			pos += len
+		elseif typ == 1 or typ == 2 then
+			local lit, dist
+			if typ == 1 then
+				if not fixedLit then
+					local l = {}
+					for i = 0, 143 do l[i] = 8 end
+					for i = 144, 255 do l[i] = 9 end
+					for i = 256, 279 do l[i] = 7 end
+					for i = 280, 287 do l[i] = 8 end
+					fixedLit = buildHuff(l, 288)
+					local d = {}
+					for i = 0, 29 do d[i] = 5 end
+					fixedDist = buildHuff(d, 30)
+				end
+				lit, dist = fixedLit, fixedDist
+			else
+				local nlen = getbits(5) + 257
+				local ndist = getbits(5) + 1
+				local ncode = getbits(4) + 4
+				local cl = {}
+				for i = 0, 18 do cl[i] = 0 end
+				for i = 1, ncode do cl[CLORDER[i]] = getbits(3) end
+				local clh = buildHuff(cl, 19)
+				local lens = {}
+				local idx = 0
+				while idx < nlen + ndist do
+					local sym = decode(clh)
+					if sym < 16 then
+						lens[idx] = sym
+						idx += 1
+					else
+						local prev, rep = 0, 0
+						if sym == 16 then
+							prev = lens[idx - 1]
+							rep = 3 + getbits(2)
+						elseif sym == 17 then
+							rep = 3 + getbits(3)
+						else
+							rep = 11 + getbits(7)
+						end
+						for _ = 1, rep do
+							lens[idx] = prev
+							idx += 1
+						end
+					end
+				end
+				local ll, dl = {}, {}
+				for i = 0, nlen - 1 do ll[i] = lens[i] end
+				for i = 0, ndist - 1 do dl[i] = lens[nlen + i] end
+				lit = buildHuff(ll, nlen)
+				dist = buildHuff(dl, ndist)
+			end
+			while true do
+				local sym = decode(lit)
+				if sym < 256 then
+					outn += 1
+					out[outn] = sym
+				elseif sym == 256 then
+					break
+				else
+					sym -= 257
+					local len = LBASE[sym + 1] + getbits(LEXT[sym + 1])
+					local ds = decode(dist)
+					local d = DBASE[ds + 1] + getbits(DEXT[ds + 1])
+					for _ = 1, len do
+						outn += 1
+						out[outn] = out[outn - d]
+					end
+				end
+			end
+		else
+			error("Bloc deflate invalide")
+		end
+	until final == 1
+	return out
+end
+
+local function u32(s, p)
+	local a, b, c, d = s:byte(p, p + 3)
+	return a * 16777216 + b * 65536 + c * 256 + d
+end
+
+PNGDecoder.Signature = PNG_SIG
+
+-- Retourne largeur, hauteur, getPixel(x, y) -> r, g, b, a  (x, y commencent à 1)
+function PNGDecoder.decode(s)
+	if s:sub(1, 8) ~= PNG_SIG then
+		error("Ce n'est pas un PNG valide")
+	end
+	local p = 9
+	local w, h, depth, ctype, interlace
+	local idat, plte, trns = {}, nil, nil
+	while p <= #s do
+		local len = u32(s, p)
+		local name = s:sub(p + 4, p + 7)
+		local ds = p + 8
+		if name == "IHDR" then
+			w, h = u32(s, ds), u32(s, ds + 4)
+			depth, ctype, interlace = s:byte(ds + 8), s:byte(ds + 9), s:byte(ds + 12)
+		elseif name == "PLTE" then
+			plte = s:sub(ds, ds + len - 1)
+		elseif name == "tRNS" then
+			trns = s:sub(ds, ds + len - 1)
+		elseif name == "IDAT" then
+			idat[#idat + 1] = s:sub(ds, ds + len - 1)
+		elseif name == "IEND" then
+			break
+		end
+		p = ds + len + 4
+	end
+	if not w then error("PNG illisible") end
+	if depth ~= 8 or interlace ~= 0 then error("Format PNG non supporté") end
+
+	local bppMap = { [0] = 1, [2] = 3, [3] = 1, [4] = 2, [6] = 4 }
+	local bpp = bppMap[ctype]
+	if not bpp then error("Type de PNG non supporté") end
+
+	local raw = inflate(table.concat(idat), 3)
+	local stride = w * bpp
+	local rows = {}
+	local prev = {}
+	for i = 1, stride do prev[i] = 0 end
+	local q = 1
+	for y = 1, h do
+		local ft = raw[q]
+		q += 1
+		local cur = {}
+		for i = 1, stride do
+			local x = raw[q + i - 1]
+			local a = (i > bpp) and cur[i - bpp] or 0
+			local b = prev[i]
+			local c = (i > bpp) and prev[i - bpp] or 0
+			local v
+			if ft == 0 then
+				v = x
+			elseif ft == 1 then
+				v = x + a
+			elseif ft == 2 then
+				v = x + b
+			elseif ft == 3 then
+				v = x + math.floor((a + b) / 2)
+			else
+				local pp = a + b - c
+				local pa, pb, pc = math.abs(pp - a), math.abs(pp - b), math.abs(pp - c)
+				local pr
+				if pa <= pb and pa <= pc then pr = a elseif pb <= pc then pr = b else pr = c end
+				v = x + pr
+			end
+			cur[i] = v % 256
+		end
+		q += stride
+		rows[y] = cur
+		prev = cur
+	end
+
+	local function getPixel(x, y)
+		local row = rows[y]
+		if ctype == 6 then
+			local i = (x - 1) * 4
+			return row[i + 1], row[i + 2], row[i + 3], row[i + 4]
+		elseif ctype == 2 then
+			local i = (x - 1) * 3
+			return row[i + 1], row[i + 2], row[i + 3], 255
+		elseif ctype == 0 then
+			local g = row[x]
+			return g, g, g, 255
+		elseif ctype == 4 then
+			local i = (x - 1) * 2
+			return row[i + 1], row[i + 1], row[i + 1], row[i + 2]
+		else
+			local idx = row[x]
+			local r, g, b = plte:byte(idx * 3 + 1, idx * 3 + 3)
+			local a = trns and trns:byte(idx + 1) or 255
+			return r, g, b, a
+		end
+	end
+
+	return w, h, getPixel
+end
+
+return PNGDecoder
+
+end)()
+
+----------------------------------------------------------------------
+-- CONFIG + CONTEXTE
+----------------------------------------------------------------------
+local CONFIG = {
+	Name = "FRONT HUB",
+	Version = "2.0",
+	WalkSpeedMin = 8,
+	WalkSpeedMax = 100,
+	WalkSpeedDefault = 16,
+	FlyMin = 10,
+	FlyMax = 300,
+	MaxResolution = 64,
+	MaxParts = 4096,
+	TargetSize = 40,
+	Distance = 30,
+	RowDelay = 0.03,
+}
+local c = UI.colors
+
+local ctx = {
+	Config = CONFIG,
+	UI = UI,
+	Flags = { Fly = false, Noclip = false, ClickTp = false, WalkSpeed = nil, BuildParts = 0 },
+	Settings = { Animations = true, Notifications = true, UIScale = 1 },
+	Alive = true,
+	Saved = {}, -- positions sauvegardées (1..3)
+	FPS = 60,
+	Bind = bind,
+	Cleanups = {},
+}
+
+function ctx.OnCleanup(fn)
+	ctx.Cleanups[#ctx.Cleanups + 1] = fn
+end
+
+function ctx.GetChar()
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	return char, hum, hrp
+end
+
+function ctx.TeleportTo(cf)
+	local char, _, hrp = ctx.GetChar()
+	if not (char and hrp) then
+		ctx.Toast("Personnage indisponible", "bad")
+		return false
+	end
+	char:PivotTo(cf)
+	return true
+end
+
+do
+	local _, _, hrp = ctx.GetChar()
+	ctx.StartCFrame = hrp and hrp.CFrame or CFrame.new(0, 10, 0)
+end
+
+bind(RunService.RenderStepped, function(dt)
+	if dt > 0 then
+		ctx.FPS = ctx.FPS * 0.9 + (1 / dt) * 0.1
+	end
+end)
+
+----------------------------------------------------------------------
+-- PAGE : MAIN
+----------------------------------------------------------------------
+local function PageMain(ctx, parent)
+	local UI = ctx.UI
+	local c = UI.colors
+	local group, scroll = UI.page(parent)
+	local startTime = os.time()
+	local gameName = "..."
+
+	task.spawn(function()
+		local ok, info = pcall(function()
+			return MarketplaceService:GetProductInfo(game.PlaceId)
+		end)
+		if ok and info and info.Name then gameName = info.Name end
+	end)
+
+	local hero = UI.card(scroll, 62)
+	UI.label(hero, "TABLEAU DE BORD", {
+		Position = UDim2.new(0, 14, 0, 8), Size = UDim2.new(1, -28, 0, 22), TextSize = 18, Font = UI.fontBold,
+	})
+	local welcome = UI.label(hero, "", {
+		Position = UDim2.new(0, 14, 0, 34), Size = UDim2.new(1, -28, 0, 18), TextSize = 12, TextColor3 = c.dim,
+	})
+
+	local function tiles(card, captions)
+		local values = {}
+		local n = #captions
+		for i, caption in ipairs(captions) do
+			local f = Instance.new("Frame")
+			f.BackgroundColor3 = c.item
+			f.BorderSizePixel = 0
+			f.Size = UDim2.new(1 / n, -6, 1, -16)
+			f.Position = UDim2.new((i - 1) / n, 3, 0, 8)
+			f.Parent = card
+			UI.corner(f, 6)
+			UI.label(f, caption, {
+				Position = UDim2.new(0, 8, 0, 6), Size = UDim2.new(1, -16, 0, 14), TextSize = 11, TextColor3 = c.dim,
+			})
+			local v = UI.label(f, "0", {
+				Position = UDim2.new(0, 8, 0, 24), Size = UDim2.new(1, -16, 0, 26), TextSize = 18, Font = UI.fontBold,
+			})
+			UI.accentize(v, "TextColor3")
+			values[i] = v
+		end
+		return values
+	end
+
+	local tileCard = UI.card(scroll, 74)
+	local tv = tiles(tileCard, { "SESSION", "FPS", "PING", "JOUEURS" })
+
+	-- État des fonctionnalités
+	local featCard = UI.card(scroll, 106)
+	UI.label(featCard, "ÉTAT DES FONCTIONNALITÉS", {
+		Position = UDim2.new(0, 14, 0, 8), Size = UDim2.new(1, -28, 0, 16), TextSize = 12, TextColor3 = c.dim,
+	})
+	local FEATURES = { "FLY", "NOCLIP", "CTRL+CLIC TP", "WALKSPEED", "IMAGE (PIXELS)", "VITESSE FLY" }
+	local featValues = {}
+	for i, name in ipairs(FEATURES) do
+		local col = (i - 1) % 2
+		local row = math.floor((i - 1) / 2)
+		local cell = Instance.new("Frame")
+		cell.BackgroundTransparency = 1
+		cell.Position = UDim2.new(col * 0.5, col == 0 and 14 or 6, 0, 30 + row * 22)
+		cell.Size = UDim2.new(0.5, -20, 0, 20)
+		cell.Parent = featCard
+		UI.label(cell, name, { Size = UDim2.new(0.6, 0, 1, 0), TextSize = 12 })
+		featValues[i] = UI.label(cell, "", {
+			Position = UDim2.new(0.6, 0, 0, 0), Size = UDim2.new(0.4, 0, 1, 0), TextSize = 12,
+			TextXAlignment = Enum.TextXAlignment.Right,
+		})
+	end
+
+	local function onoff(v)
+		if v then
+			return '<font color="' .. UI.hex(c.good) .. '">ON</font>'
+		end
+		return '<font color="' .. UI.hex(c.bad) .. '">OFF</font>'
+	end
+
+	-- Stats du jeu (leaderstats : Gold, Level... si le jeu en a)
+	local statCard = UI.card(scroll, 130)
+	UI.label(statCard, "STATS DU JEU (leaderstats)", {
+		Position = UDim2.new(0, 14, 0, 8), Size = UDim2.new(1, -28, 0, 16), TextSize = 12, TextColor3 = c.dim,
+	})
+	local statBody = UI.label(statCard, "", {
+		Position = UDim2.new(0, 14, 0, 30), Size = UDim2.new(1, -28, 1, -38), TextSize = 13,
+	})
+
+	local function getPing()
+		local ok, value = pcall(function()
+			return StatsService.Network.ServerStatsItem["Data Ping"]:GetValue()
+		end)
+		if ok and value then return math.floor(value) end
+		return nil
+	end
+
+	local function update()
+		welcome.Text = string.format("Bienvenue, %s  •  Jeu : %s", player.DisplayName, gameName)
+		tv[1].Text = UI.fmtTime(os.time() - startTime)
+		tv[2].Text = tostring(math.floor(ctx.FPS))
+		local ping = getPing()
+		tv[3].Text = ping and (ping .. " ms") or "-"
+		tv[4].Text = tostring(#Players:GetPlayers())
+
+		featValues[1].Text = onoff(ctx.Flags.Fly)
+		featValues[2].Text = onoff(ctx.Flags.Noclip)
+		featValues[3].Text = onoff(ctx.Flags.ClickTp)
+		featValues[4].Text = ctx.Flags.WalkSpeed and tostring(ctx.Flags.WalkSpeed) or '<font color="' .. UI.hex(c.dim) .. '">défaut</font>'
+		featValues[5].Text = ctx.Flags.BuildParts > 0 and (ctx.Flags.BuildParts .. " pièces") or onoff(false)
+		featValues[6].Text = tostring(ctx.Flags.FlySpeed or 50)
+
+		local lines = {}
+		local ls = player:FindFirstChild("leaderstats")
+		if ls then
+			for _, v in ipairs(ls:GetChildren()) do
+				if v:IsA("ValueBase") and #lines < 6 then
+					lines[#lines + 1] = string.format('<font color="%s">%s</font>  %s', UI.hex(c.dim), v.Name, tostring(v.Value))
+				end
+			end
+		end
+		statBody.Text = #lines > 0 and table.concat(lines, "\n") or "Ce jeu n'expose pas de leaderstats."
+	end
+
+	task.spawn(function()
+		while ctx.Alive do
+			task.wait(0.5)
+			if group.Visible then pcall(update) end
+		end
+	end)
+	update()
+	return group
+end
+
+----------------------------------------------------------------------
+-- PAGE : MOVEMENT
+----------------------------------------------------------------------
+local function PageMovement(ctx, parent)
+	local UI = ctx.UI
+	local c = UI.colors
+	local cfg = ctx.Config
+	local group, scroll = UI.page(parent)
+
+	local flySpeed = 50
+	ctx.Flags.FlySpeed = flySpeed
+	local walkSpeed = cfg.WalkSpeedDefault
+	local customWalk = false
+	local upHeld, downHeld = false, false
+	local bodyVel, bodyGyro, flyConn, noclipConn
+
+	do
+		local _, hum = ctx.GetChar()
+		if hum then
+			walkSpeed = math.clamp(math.floor(hum.WalkSpeed + 0.5), cfg.WalkSpeedMin, cfg.WalkSpeedMax)
+		end
+	end
+
+	-- FLY
+	local flyCard = UI.card(scroll, 118)
+	UI.label(flyCard, "FLY", {
+		Position = UDim2.new(0, 14, 0, 8), Size = UDim2.new(0.5, 0, 0, 18), TextSize = 14, Font = UI.fontBold,
+	})
+	local flyBtn, speedLabel
+
+	local function stopFly()
+		ctx.Flags.Fly = false
+		if flyConn then flyConn:Disconnect() flyConn = nil end
+		if bodyVel then bodyVel:Destroy() bodyVel = nil end
+		if bodyGyro then bodyGyro:Destroy() bodyGyro = nil end
+		local _, hum = ctx.GetChar()
+		if hum then hum.PlatformStand = false end
+		if flyBtn then UI.setOn(flyBtn, false, "FLY : ON", "FLY : OFF") end
+	end
+
+	local function startFly()
+		local _, hum, hrp = ctx.GetChar()
+		if not (hrp and hum) then
+			ctx.Toast("Personnage indisponible", "bad")
+			return
+		end
+		ctx.Flags.Fly = true
+		hum.PlatformStand = true
+
+		bodyVel = Instance.new("BodyVelocity")
+		bodyVel.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+		bodyVel.Velocity = Vector3.zero
+		bodyVel.Parent = hrp
+
+		bodyGyro = Instance.new("BodyGyro")
+		bodyGyro.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+		bodyGyro.P = 9e4
+		bodyGyro.CFrame = hrp.CFrame
+		bodyGyro.Parent = hrp
+
+		flyConn = RunService.RenderStepped:Connect(function()
+			local cam = workspace.CurrentCamera
+			if not (cam and hrp.Parent and bodyVel and bodyGyro) then return end
+			local look, right = cam.CFrame.LookVector, cam.CFrame.RightVector
+			local flatLook = Vector3.new(look.X, 0, look.Z)
+			local flatRight = Vector3.new(right.X, 0, right.Z)
+			if flatLook.Magnitude > 0 then flatLook = flatLook.Unit end
+			if flatRight.Magnitude > 0 then flatRight = flatRight.Unit end
+
+			local move = hum.MoveDirection -- clavier ET joystick mobile
+			local vel = look * move:Dot(flatLook) + right * move:Dot(flatRight)
+
+			local up = 0
+			if upHeld or UIS:IsKeyDown(Enum.KeyCode.Space) or UIS:IsKeyDown(Enum.KeyCode.E) then up += 1 end
+			if downHeld or UIS:IsKeyDown(Enum.KeyCode.LeftShift) or UIS:IsKeyDown(Enum.KeyCode.Q) then up -= 1 end
+
+			bodyVel.Velocity = vel * flySpeed + Vector3.new(0, up * flySpeed, 0)
+			bodyGyro.CFrame = cam.CFrame
+		end)
+		UI.setOn(flyBtn, true, "FLY : ON", "FLY : OFF")
+	end
+
+	local function toggleFly()
+		if ctx.Flags.Fly then stopFly() else startFly() end
+	end
+
+	flyBtn = UI.button(flyCard, "FLY : OFF", { Position = UDim2.new(0, 14, 0, 32), Size = UDim2.new(1, -28, 0, 38), TextSize = 15 })
+	flyBtn.MouseButton1Click:Connect(toggleFly)
+
+	speedLabel = UI.stepper(flyCard, 78, "VITESSE FLY", tostring(flySpeed), function()
+		flySpeed = math.clamp(flySpeed - 10, cfg.FlyMin, cfg.FlyMax)
+		ctx.Flags.FlySpeed = flySpeed
+		speedLabel.Text = tostring(flySpeed)
+	end, function()
+		flySpeed = math.clamp(flySpeed + 10, cfg.FlyMin, cfg.FlyMax)
+		ctx.Flags.FlySpeed = flySpeed
+		speedLabel.Text = tostring(flySpeed)
+	end)
+
+	-- NOCLIP
+	local noclipCard = UI.card(scroll, 52)
+	local noclipBtn
+	local function setNoclip(on)
+		ctx.Flags.Noclip = on
+		if noclipConn then noclipConn:Disconnect() noclipConn = nil end
+		if on then
+			noclipConn = RunService.Stepped:Connect(function()
+				local char = player.Character
+				if not char then return end
+				for _, part in ipairs(char:GetDescendants()) do
+					if part:IsA("BasePart") then part.CanCollide = false end
+				end
+			end)
+		end
+		UI.setOn(noclipBtn, on, "ON", "OFF")
+	end
+	noclipBtn = UI.toggle(noclipCard, 10, "NOCLIP (traverser les murs)", false, function()
+		setNoclip(not ctx.Flags.Noclip)
+	end)
+
+	-- WALKSPEED (limité entre Min et Max)
+	local walkCard = UI.card(scroll, 52)
+	local walkLabel
+	local function applyWalk()
+		if not customWalk then return end
+		local _, hum = ctx.GetChar()
+		if hum then hum.WalkSpeed = walkSpeed end
+	end
+	local function changeWalk(delta)
+		walkSpeed = math.clamp(walkSpeed + delta, cfg.WalkSpeedMin, cfg.WalkSpeedMax)
+		customWalk = true
+		ctx.Flags.WalkSpeed = walkSpeed
+		walkLabel.Text = tostring(walkSpeed)
+		applyWalk()
+	end
+	walkLabel = UI.stepper(walkCard, 10, "WALKSPEED (" .. cfg.WalkSpeedMin .. " - " .. cfg.WalkSpeedMax .. ")", tostring(walkSpeed),
+		function() changeWalk(-2) end, function() changeWalk(2) end)
+	task.spawn(function()
+		while ctx.Alive do
+			task.wait(0.4)
+			applyWalk()
+		end
+	end)
+
+	-- Position rapide (emplacement 1)
+	local posCard = UI.card(scroll, 58)
+	local saveBtn = UI.button(posCard, "SAUVER POSITION", { Position = UDim2.new(0, 12, 0, 12), Size = UDim2.new(0.5, -18, 0, 34), TextSize = 13 })
+	local backBtn = UI.button(posCard, "REVENIR", { Position = UDim2.new(0.5, 6, 0, 12), Size = UDim2.new(0.5, -18, 0, 34), TextSize = 13 })
+	saveBtn.MouseButton1Click:Connect(function()
+		local _, _, hrp = ctx.GetChar()
+		if hrp then
+			ctx.Saved[1] = hrp.CFrame
+			ctx.Toast("Position sauvegardée", "good")
+		end
+	end)
+	backBtn.MouseButton1Click:Connect(function()
+		if ctx.Saved[1] then
+			if ctx.TeleportTo(ctx.Saved[1]) then ctx.Toast("Retour à la position", "good") end
+		else
+			ctx.Toast("Aucune position sauvegardée", "bad")
+		end
+	end)
+
+	-- Boutons monter / descendre (mobile)
+	if UIS.TouchEnabled then
+		local touchCard = UI.card(scroll, 58)
+		local upBtn = UI.button(touchCard, "MONTER", { Position = UDim2.new(0, 12, 0, 12), Size = UDim2.new(0.5, -18, 0, 34), TextSize = 13 })
+		local downBtn = UI.button(touchCard, "DESCENDRE", { Position = UDim2.new(0.5, 6, 0, 12), Size = UDim2.new(0.5, -18, 0, 34), TextSize = 13 })
+		upBtn.MouseButton1Down:Connect(function() upHeld = true end)
+		upBtn.MouseButton1Up:Connect(function() upHeld = false end)
+		upBtn.MouseLeave:Connect(function() upHeld = false end)
+		downBtn.MouseButton1Down:Connect(function() downHeld = true end)
+		downBtn.MouseButton1Up:Connect(function() downHeld = false end)
+		downBtn.MouseLeave:Connect(function() downHeld = false end)
+	end
+
+	local note = UI.card(scroll, 48)
+	UI.label(note, "Touche F = fly  •  Z/Q/S/D bouger  •  Espace/E monter  •  Shift/Q descendre", {
+		Position = UDim2.new(0, 14, 0, 8), Size = UDim2.new(1, -28, 1, -16), TextSize = 12, TextColor3 = c.dim,
+	})
+
+	ctx.Bind(UIS.InputBegan, function(input, gpe)
+		if gpe then return end
+		if input.KeyCode == Enum.KeyCode.F then toggleFly() end
+	end)
+	ctx.Bind(player.CharacterAdded, function() stopFly() end)
+
+	ctx.OnCleanup(function()
+		stopFly()
+		if noclipConn then noclipConn:Disconnect() noclipConn = nil end
+	end)
+
+	return group
+end
+
+----------------------------------------------------------------------
+-- PAGE : TELEPORT
+----------------------------------------------------------------------
+local function PageTeleport(ctx, parent)
+	local UI = ctx.UI
+	local c = UI.colors
+	local group, scroll = UI.page(parent)
+	local mouse = player:GetMouse()
+
+	-- Retour au départ
+	local homeCard = UI.card(scroll, 58)
+	local homeBtn = UI.button(homeCard, "RETOUR AU POINT DE DÉPART", {
+		Position = UDim2.new(0, 12, 0, 12), Size = UDim2.new(1, -24, 0, 34), TextSize = 14,
+	})
+	homeBtn.MouseButton1Click:Connect(function()
+		local spawn = workspace:FindFirstChildWhichIsA("SpawnLocation", true)
+		local cf = spawn and (spawn.CFrame * CFrame.new(0, spawn.Size.Y / 2 + 4, 0)) or ctx.StartCFrame
+		if ctx.TeleportTo(cf) then ctx.Toast("Retour au point de départ", "good") end
+	end)
+
+	-- Liste des joueurs
+	local listCard = UI.card(scroll, 210)
+	UI.label(listCard, "JOUEURS (clique pour te téléporter)", {
+		Position = UDim2.new(0, 14, 0, 8), Size = UDim2.new(1, -28, 0, 16), TextSize = 12, TextColor3 = c.dim,
+	})
+	local list = Instance.new("ScrollingFrame")
+	list.BackgroundTransparency = 1
+	list.BorderSizePixel = 0
+	list.Position = UDim2.new(0, 10, 0, 30)
+	list.Size = UDim2.new(1, -20, 1, -40)
+	list.ScrollBarThickness = 3
+	list.CanvasSize = UDim2.new()
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.Parent = listCard
+	UI.accentize(list, "ScrollBarImageColor3")
+	UI.new("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.Name, Parent = list })
+	UI.new("UIPadding", { PaddingRight = UDim.new(0, 6), Parent = list })
+
+	local function refreshPlayers()
+		for _, child in ipairs(list:GetChildren()) do
+			if child:IsA("TextButton") then child:Destroy() end
+		end
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= player then
+				local b = UI.button(list, plr.DisplayName .. "  (@" .. plr.Name .. ")", { Size = UDim2.new(1, 0, 0, 30), TextSize = 12 })
+				b.Name = plr.Name
+				b.MouseButton1Click:Connect(function()
+					local char = plr.Character
+					local target = char and char:FindFirstChild("HumanoidRootPart")
+					if target then
+						if ctx.TeleportTo(target.CFrame * CFrame.new(0, 0, 3)) then
+							ctx.Toast("TP vers " .. plr.DisplayName, "good")
+						end
+					else
+						ctx.Toast("Joueur introuvable", "bad")
+					end
+				end)
+			end
+		end
+	end
+	ctx.Bind(Players.PlayerAdded, refreshPlayers)
+	ctx.Bind(Players.PlayerRemoving, function() task.defer(refreshPlayers) end)
+	refreshPlayers()
+
+	-- Ctrl + Clic
+	local clickCard = UI.card(scroll, 52)
+	local clickBtn
+	clickBtn = UI.toggle(clickCard, 10, "CTRL + CLIC = TÉLÉPORTATION", false, function()
+		ctx.Flags.ClickTp = not ctx.Flags.ClickTp
+		UI.setOn(clickBtn, ctx.Flags.ClickTp, "ON", "OFF")
+	end)
+	ctx.Bind(UIS.InputBegan, function(input, gpe)
+		if gpe then return end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 and ctx.Flags.ClickTp and UIS:IsKeyDown(Enum.KeyCode.LeftControl) then
+			if mouse.Hit then
+				ctx.TeleportTo(CFrame.new(mouse.Hit.Position + Vector3.new(0, 3, 0)))
+			end
+		end
+	end)
+
+	-- Positions sauvegardées
+	local header = UI.card(scroll, 30)
+	UI.label(header, "POSITIONS SAUVEGARDÉES", {
+		Position = UDim2.new(0, 14, 0, 7), Size = UDim2.new(1, -28, 0, 16), TextSize = 12, TextColor3 = c.dim,
+	})
+	for slot = 1, 3 do
+		local card = UI.card(scroll, 50)
+		UI.label(card, "EMPLACEMENT " .. slot, { Position = UDim2.new(0, 14, 0, 16), Size = UDim2.new(0.4, 0, 0, 18), TextSize = 13 })
+		local saveBtn = UI.button(card, "SAUVER", { Position = UDim2.new(1, -210, 0.5, -16), Size = UDim2.new(0, 94, 0, 32), TextSize = 12 })
+		local goBtn = UI.button(card, "ALLER", { Position = UDim2.new(1, -106, 0.5, -16), Size = UDim2.new(0, 94, 0, 32), TextSize = 12 })
+		saveBtn.MouseButton1Click:Connect(function()
+			local _, _, hrp = ctx.GetChar()
+			if hrp then
+				ctx.Saved[slot] = hrp.CFrame
+				ctx.Toast("Position " .. slot .. " sauvegardée", "good")
+			end
+		end)
+		goBtn.MouseButton1Click:Connect(function()
+			if ctx.Saved[slot] then
+				if ctx.TeleportTo(ctx.Saved[slot]) then ctx.Toast("Retour à la position " .. slot, "good") end
+			else
+				ctx.Toast("Aucune position sauvegardée (" .. slot .. ")", "bad")
+			end
+		end)
+	end
+
+	return group
+end
+
+----------------------------------------------------------------------
+-- PAGE : BUILDER (image -> pixels, visible uniquement par toi)
+----------------------------------------------------------------------
+local function PageBuilder(ctx, parent)
+	local UI = ctx.UI
+	local c = UI.colors
+	local cfg = ctx.Config
+	local group, scroll = UI.page(parent)
+
+	local resolution = 32
+	local busy = false
+	local token = 0
+
+	local urlCard = UI.card(scroll, 78)
+	UI.label(urlCard, "LIEN DE L'IMAGE (jpg, png, webp...)", {
+		Position = UDim2.new(0, 14, 0, 8), Size = UDim2.new(1, -28, 0, 16), TextSize = 12, TextColor3 = c.dim,
+	})
+	local urlBox = UI.input(urlCard, { Placeholder = "https://...", Position = UDim2.new(0, 14, 0, 30), Size = UDim2.new(1, -28, 0, 36) })
+
+	local resCard = UI.card(scroll, 52)
+	local resLabel
+	local function setRes(v)
+		resolution = math.clamp(v, 8, cfg.MaxResolution)
+		resLabel.Text = tostring(resolution)
+	end
+	resLabel = UI.stepper(resCard, 10, "RÉSOLUTION (pixels max par côté)", tostring(resolution),
+		function() setRes(resolution - 8) end, function() setRes(resolution + 8) end)
+
+	local actionCard = UI.card(scroll, 58)
+	local buildBtn = UI.button(actionCard, "CONSTRUIRE", { Position = UDim2.new(0, 12, 0, 12), Size = UDim2.new(0.5, -18, 0, 34), TextSize = 14 })
+	local clearBtn = UI.button(actionCard, "EFFACER", { Position = UDim2.new(0.5, 6, 0, 12), Size = UDim2.new(0.5, -18, 0, 34), TextSize = 14 })
+
+	local statusCard = UI.card(scroll, 92)
+	local status = UI.label(statusCard, "", {
+		Position = UDim2.new(0, 14, 0, 10), Size = UDim2.new(1, -28, 1, -30), TextSize = 12, TextColor3 = c.dim,
+	})
+	local statusBar = UI.bar(statusCard, { Position = UDim2.new(0, 14, 1, -18), Size = UDim2.new(1, -28, 0, 6) })
+	local function setStatus(text, level)
+		status.Text = text
+		status.TextColor3 = (level == "good" and c.good) or (level == "bad" and c.bad) or c.dim
+	end
+	setStatus("Colle un lien direct vers une image (ou une page Bing Images) puis clique sur CONSTRUIRE. L'image apparaît devant toi. Elle n'est visible que par toi.")
+
+	local function clearPixels()
+		token += 1
+		local f = workspace:FindFirstChild("FrontHubV2_Pixels")
+		if f then f:Destroy() end
+		ctx.Flags.BuildParts = 0
+	end
+	ctx.OnCleanup(clearPixels)
+
+	local function httpGetBinary(url)
+		local req = (syn and syn.request) or (http and http.request) or http_request or request or (fluxus and fluxus.request)
+		local lastStatus, lastErr
+		if req then
+			local ok, res = pcall(req, { Url = url, Method = "GET" })
+			if ok and res then
+				if res.Body and (res.StatusCode == nil or res.StatusCode == 200) then return res.Body end
+				lastStatus, lastErr = res.StatusCode, res.Body
+			elseif not ok then
+				lastErr = tostring(res)
+			end
+		end
+		local ok, body = pcall(function() return game:HttpGet(url) end)
+		if ok and body then return body end
+		if not ok then lastErr = tostring(body) end
+		return nil, lastStatus, lastErr
+	end
+
+	local function fetchPNG(link, res)
+		local enc = HttpService:UrlEncode(link)
+		local bare = link:gsub("^https?://", "")
+		local candidates = {
+			string.format("https://wsrv.nl/?url=%s&w=%d&h=%d&fit=inside&output=png", enc, res, res),
+			string.format("https://images.weserv.nl/?url=%s&w=%d&h=%d&fit=inside&output=png", enc, res, res),
+			string.format("https://images.weserv.nl/?url=%s&w=%d&h=%d&fit=inside&output=png", HttpService:UrlEncode(bare), res, res),
+		}
+		local lastErr = "aucune réponse (HTTP bloqué par ton executor ?)"
+		for _, u in ipairs(candidates) do
+			local body, st, err = httpGetBinary(u)
+			if body and body:sub(1, 8) == PNGDecoder.Signature then
+				return body
+			elseif body then
+				lastErr = "réponse reçue mais ce n'est pas une image : " .. (body:sub(1, 80):gsub("%c", " "))
+			elseif err then
+				lastErr = string.format("erreur %s : %s", tostring(st), (tostring(err):sub(1, 80):gsub("%c", " ")))
+			end
+		end
+		return nil, lastErr
+	end
+
+	local function buildImage()
+		local link = urlBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+		if link == "" then
+			ctx.Toast("Colle d'abord un lien d'image", "bad")
+			return
+		end
+		local media = link:match("mediaurl=([^&]+)")
+		if media then
+			link = (media:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end))
+		end
+		local _, _, hrp = ctx.GetChar()
+		if not hrp then
+			ctx.Toast("Personnage indisponible", "bad")
+			return
+		end
+
+		clearPixels()
+		local myToken = token
+		statusBar.Set(0)
+		setStatus("Téléchargement de l'image...", "info")
+		local body, err = fetchPNG(link, resolution)
+		if myToken ~= token then return end
+		if not body then
+			setStatus("Téléchargement impossible : " .. tostring(err), "bad")
+			return
+		end
+		local ok, w, h, getPixel = pcall(PNGDecoder.decode, body)
+		if not ok then
+			setStatus("Image illisible : " .. tostring(w), "bad")
+			return
+		end
+
+		-- Fusionne les pixels identiques d'une ligne en une seule pièce
+		local rows, count = {}, 0
+		for y = 1, h do
+			local runs = {}
+			local x = 1
+			while x <= w do
+				local r, g, b, a = getPixel(x, y)
+				if a >= 128 then
+					local x2 = x
+					while x2 < w do
+						local r2, g2, b2, a2 = getPixel(x2 + 1, y)
+						if a2 >= 128 and r2 == r and g2 == g and b2 == b then x2 += 1 else break end
+					end
+					runs[#runs + 1] = { x, x2, r, g, b }
+					count += 1
+					x = x2 + 1
+				else
+					x += 1
+				end
+			end
+			rows[y] = runs
+		end
+		if count == 0 then
+			setStatus("L'image est vide ou transparente", "bad")
+			return
+		end
+		if count > cfg.MaxParts then
+			setStatus("Image trop complexe (" .. count .. " pièces). Baisse la résolution.", "bad")
+			return
+		end
+
+		local folder = Instance.new("Folder")
+		folder.Name = "FrontHubV2_Pixels"
+		folder.Parent = workspace
+
+		local ps = cfg.TargetSize / math.max(w, h)
+		local pos = hrp.Position
+		local center = pos + hrp.CFrame.LookVector * cfg.Distance + Vector3.new(0, (h * ps) / 2 - 2, 0)
+		local base = CFrame.lookAt(center, Vector3.new(pos.X, center.Y, pos.Z))
+
+		for y = 1, h do
+			if myToken ~= token or not folder.Parent then return end
+			for _, run in ipairs(rows[y]) do
+				local x1, x2 = run[1], run[2]
+				local part = Instance.new("Part")
+				part.Anchored = true
+				part.CanCollide = false
+				part.CanQuery = false
+				part.CanTouch = false
+				part.Locked = true
+				part.Material = Enum.Material.SmoothPlastic
+				part.Color = Color3.fromRGB(run[3], run[4], run[5])
+				part.Size = Vector3.new((x2 - x1 + 1) * ps, ps, 0.5)
+				local centerCol = (x1 + x2) / 2
+				part.CFrame = base * CFrame.new(-(centerCol - (w + 1) / 2) * ps, (h / 2 - y + 0.5) * ps, 0)
+				part.Parent = folder
+			end
+			statusBar.Set(y / h)
+			setStatus(string.format("Construction... %d%%", math.floor(y / h * 100)), "info")
+			task.wait(cfg.RowDelay)
+		end
+		ctx.Flags.BuildParts = count
+		setStatus(string.format("Terminé ! Image %dx%d construite (%d pièces). Visible uniquement par toi.", w, h, count), "good")
+		ctx.Toast("Image construite", "good")
+	end
+
+	buildBtn.MouseButton1Click:Connect(function()
+		if busy then return end
+		busy = true
+		UI.setOn(buildBtn, true, "EN COURS...", "CONSTRUIRE")
+		task.spawn(function()
+			local ok, err = pcall(buildImage)
+			if not ok then setStatus("Erreur : " .. tostring(err), "bad") end
+			busy = false
+			UI.setOn(buildBtn, false, "EN COURS...", "CONSTRUIRE")
+		end)
+	end)
+	clearBtn.MouseButton1Click:Connect(function()
+		clearPixels()
+		statusBar.Set(0)
+		setStatus("Image effacée.", "info")
+	end)
+
+	return group
+end
+
+----------------------------------------------------------------------
+-- PAGE : PLAYER
+----------------------------------------------------------------------
+local function PagePlayer(ctx, parent)
+	local UI = ctx.UI
+	local c = UI.colors
+	local group, scroll = UI.page(parent)
+	local startTime = os.time()
+
+	local function infoCard(title, height)
+		local card = UI.card(scroll, height)
+		UI.label(card, title, {
+			Position = UDim2.new(0, 14, 0, 8), Size = UDim2.new(1, -28, 0, 16), TextSize = 12, TextColor3 = c.dim,
+		})
+		local body = UI.label(card, "", { Position = UDim2.new(0, 14, 0, 30), Size = UDim2.new(1, -28, 1, -38), TextSize = 13 })
+		body.LineHeight = 1.25
+		return body
+	end
+	local charBody = infoCard("PERSONNAGE", 158)
+	local sessionBody = infoCard("SESSION", 110)
+	local statBody = infoCard("STATS DU JEU (leaderstats)", 130)
+
+	local function row(key, value)
+		return string.format('<font color="%s">%s</font>  %s', UI.hex(c.dim), key, tostring(value))
+	end
+
+	local function update()
+		local _, hum, hrp = ctx.GetChar()
+		charBody.Text = table.concat({
+			row("Nom        :", player.Name .. "  (" .. player.DisplayName .. ")"),
+			row("UserId     :", player.UserId),
+			row("Âge compte :", player.AccountAge .. " jours"),
+			row("Santé      :", hum and string.format("%d / %d", math.floor(hum.Health), math.floor(hum.MaxHealth)) or "-"),
+			row("WalkSpeed  :", hum and math.floor(hum.WalkSpeed) or "-"),
+			row("Position   :", hrp and string.format("%d, %d, %d", math.floor(hrp.Position.X), math.floor(hrp.Position.Y), math.floor(hrp.Position.Z)) or "-"),
+			row("FPS        :", math.floor(ctx.FPS)),
+		}, "\n")
+		sessionBody.Text = table.concat({
+			row("Temps      :", UI.fmtTime(os.time() - startTime)),
+			row("Joueurs    :", #Players:GetPlayers() .. " / " .. Players.MaxPlayers),
+			row("PlaceId    :", game.PlaceId),
+			row("Serveur    :", string.sub(game.JobId, 1, 8)),
+		}, "\n")
+		local lines = {}
+		local ls = player:FindFirstChild("leaderstats")
+		if ls then
+			for _, v in ipairs(ls:GetChildren()) do
+				if v:IsA("ValueBase") and #lines < 6 then lines[#lines + 1] = row(v.Name .. " :", v.Value) end
+			end
+		end
+		statBody.Text = #lines > 0 and table.concat(lines, "\n") or "Ce jeu n'expose pas de leaderstats."
+	end
+
+	task.spawn(function()
+		while ctx.Alive do
+			task.wait(0.3)
+			if group.Visible then pcall(update) end
+		end
+	end)
+	update()
+	return group
+end
+
+----------------------------------------------------------------------
+-- PAGE : SETTINGS
+----------------------------------------------------------------------
+local function PageSettings(ctx, parent)
+	local UI = ctx.UI
+	local c = UI.colors
+	local group, scroll = UI.page(parent)
+
+	local toggles = UI.card(scroll, 100)
+	UI.toggle(toggles, 10, "ANIMATIONS", ctx.Settings.Animations, function(btn)
+		ctx.Settings.Animations = not ctx.Settings.Animations
+		UI.animations = ctx.Settings.Animations
+		UI.setOn(btn, ctx.Settings.Animations, "ON", "OFF")
+	end)
+	UI.toggle(toggles, 54, "NOTIFICATIONS", ctx.Settings.Notifications, function(btn)
+		ctx.Settings.Notifications = not ctx.Settings.Notifications
+		UI.setOn(btn, ctx.Settings.Notifications, "ON", "OFF")
+	end)
+
+	local themeCard = UI.card(scroll, 92)
+	UI.label(themeCard, "THÈME  (noir + couleur d'accent)", {
+		Position = UDim2.new(0, 14, 0, 8), Size = UDim2.new(1, -28, 0, 16), TextSize = 12, TextColor3 = c.dim,
+	})
+	local PRESETS = {
+		{ name = "VERT NÉON", color = Color3.fromRGB(57, 255, 20) },
+		{ name = "CYAN", color = Color3.fromRGB(0, 229, 255) },
+		{ name = "VIOLET", color = Color3.fromRGB(190, 90, 255) },
+		{ name = "ORANGE", color = Color3.fromRGB(255, 150, 0) },
+	}
+	local presetButtons = {}
+	local function markPreset(index)
+		for i, b in ipairs(presetButtons) do UI.setOn(b, i == index) end
+	end
+	for i, preset in ipairs(PRESETS) do
+		local b = UI.button(themeCard, preset.name, {
+			Position = UDim2.new((i - 1) / #PRESETS, i == 1 and 14 or 4, 0, 40),
+			Size = UDim2.new(1 / #PRESETS, i == 1 and -18 or (i == #PRESETS and -18 or -8), 0, 34),
+			TextSize = 11,
+		})
+		presetButtons[i] = b
+		b.MouseButton1Click:Connect(function()
+			UI.setAccent(preset.color)
+			markPreset(i)
+		end)
+	end
+	markPreset(1)
+
+	local sizeCard = UI.card(scroll, 52)
+	local sizeLabel
+	local function setSize(v)
+		ctx.Settings.UIScale = math.clamp(math.floor(v * 10 + 0.5) / 10, 0.6, 1.4)
+		sizeLabel.Text = math.floor(ctx.Settings.UIScale * 100 + 0.5) .. "%"
+		ctx.RefreshScale()
+	end
+	sizeLabel = UI.stepper(sizeCard, 10, "TAILLE DE L'INTERFACE", "100%",
+		function() setSize(ctx.Settings.UIScale - 0.1) end, function() setSize(ctx.Settings.UIScale + 0.1) end)
+
+	local info = UI.card(scroll, 96)
+	UI.label(info, string.format("%s  v%s", CONFIG.Name, CONFIG.Version), {
+		Position = UDim2.new(0, 14, 0, 8), Size = UDim2.new(1, -28, 0, 20), TextSize = 15, Font = UI.fontBold,
+	})
+	UI.label(info, "RightShift ou bouton FH : ouvrir / fermer le menu\nF : fly ON/OFF\nTout est local : seul toi vois ce que fait ce menu.", {
+		Position = UDim2.new(0, 14, 0, 32), Size = UDim2.new(1, -28, 0, 58), TextSize = 12, TextColor3 = c.dim,
+	})
+
+	local killCard = UI.card(scroll, 58)
+	local killBtn = UI.button(killCard, "FERMER ET SUPPRIMER LE HUB", {
+		Position = UDim2.new(0, 12, 0, 12), Size = UDim2.new(1, -24, 0, 34), TextSize = 13,
+	})
+	killBtn.MouseButton1Click:Connect(function()
+		ctx.Destroy()
+	end)
+
+	return group
+end
+
+----------------------------------------------------------------------
+-- FENÊTRE
+----------------------------------------------------------------------
+local gui = UI.new("ScreenGui", {
+	Name = "FrontHubV2", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	IgnoreGuiInset = true, DisplayOrder = 999, Parent = parentGui,
+})
+
+local window = UI.new("Frame", {
+	Name = "Window", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+	Size = UDim2.new(0, 660, 0, 420), BackgroundColor3 = c.bg, BorderSizePixel = 0,
+	ClipsDescendants = true, Visible = false, Parent = gui,
+})
+UI.corner(window, 10)
+UI.glow(UI.stroke(window, 2))
+UI.new("UIGradient", {
+	Color = ColorSequence.new(Color3.fromRGB(4, 8, 4), Color3.fromRGB(8, 14, 8)),
+	Rotation = 90, Parent = window,
+})
+local winScale = UI.new("UIScale", { Scale = 0, Parent = window })
+
+local FULL = UDim2.new(0, 660, 0, 420)
+local MINI = UDim2.new(0, 660, 0, 46)
+local isOpen, minimized = false, false
+
+local function fitScale()
+	local cam = workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+	local base = math.min(vp.X / 700, vp.Y / 460, 1.25)
+	return math.max(0.45, base) * ctx.Settings.UIScale
+end
+
+function ctx.RefreshScale()
+	if isOpen then
+		UI.tween(winScale, 0.15, { Scale = fitScale() })
+	end
+end
+
+local function setOpen(open)
+	isOpen = open
+	if open then window.Visible = true end
+	UI.tween(winScale, 0.25, { Scale = open and fitScale() or 0 }, Enum.EasingStyle.Back,
+		open and Enum.EasingDirection.Out or Enum.EasingDirection.In)
+	if not open then
+		task.delay(UI.animations and 0.27 or 0, function()
+			if not isOpen then window.Visible = false end
+		end)
+	end
+end
+
+if workspace.CurrentCamera then
+	bind(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), function()
+		if isOpen then winScale.Scale = fitScale() end
+	end)
+end
+
+-- Barre du haut : logo + boutons
+local top = UI.new("Frame", { Name = "Top", Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = c.panel, BorderSizePixel = 0, Parent = window })
+local topLine = UI.new("Frame", { Position = UDim2.new(0, 0, 1, -1), Size = UDim2.new(1, 0, 0, 1), BorderSizePixel = 0, Parent = top })
+UI.accentize(topLine, "BackgroundColor3")
+
+local diamond = UI.new("Frame", {
+	Position = UDim2.new(0, 16, 0, 12), Size = UDim2.new(0, 22, 0, 22), Rotation = 45,
+	BackgroundTransparency = 1, BorderSizePixel = 0, Parent = top,
+})
+UI.glow(UI.stroke(diamond, 2))
+local logoF = UI.label(top, "F", {
+	Position = UDim2.new(0, 16, 0, 12), Size = UDim2.new(0, 22, 0, 22), TextSize = 15, Font = UI.fontTitle,
+	TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
+})
+UI.accentize(logoF, "TextColor3")
+local logoText = UI.label(top, "", {
+	Position = UDim2.new(0, 50, 0, 0), Size = UDim2.new(0, 190, 1, 0), TextSize = 20, Font = UI.fontTitle,
+	TextYAlignment = Enum.TextYAlignment.Center,
+})
+UI.onAccent(function(color)
+	logoText.Text = 'FRONT <font color="' .. UI.hex(color) .. '">HUB</font>'
+end)
+local cursor = UI.label(top, "_", {
+	Position = UDim2.new(0, 158, 0, 0), Size = UDim2.new(0, 14, 1, 0), TextSize = 20, Font = UI.font,
+	TextYAlignment = Enum.TextYAlignment.Center,
+})
+UI.accentize(cursor, "TextColor3")
+task.spawn(function()
+	while gui.Parent do
+		cursor.TextTransparency = (UI.animations and math.floor(os.clock() * 2) % 2 == 0) and 1 or 0
+		task.wait(0.25)
+	end
+end)
+UI.label(top, "v" .. CONFIG.Version, {
+	Position = UDim2.new(0, 190, 0, 0), Size = UDim2.new(0, 60, 1, 0), TextSize = 11, TextColor3 = c.dim,
+	TextYAlignment = Enum.TextYAlignment.Center,
+})
+
+local minBtn = UI.button(top, "-", { Position = UDim2.new(1, -78, 0.5, -13), Size = UDim2.new(0, 30, 0, 26), TextSize = 18 })
+local closeBtn = UI.button(top, "X", { Position = UDim2.new(1, -40, 0.5, -13), Size = UDim2.new(0, 30, 0, 26), TextSize = 14 })
+
+-- Barre latérale + contenu
+local side = UI.new("Frame", {
+	Name = "Side", Position = UDim2.new(0, 0, 0, 46), Size = UDim2.new(0, 150, 1, -46),
+	BackgroundColor3 = Color3.fromRGB(7, 11, 7), BorderSizePixel = 0, Parent = window,
+})
+local indicator = UI.new("Frame", { Position = UDim2.new(0, 0, 0, 12), Size = UDim2.new(0, 3, 0, 28), BorderSizePixel = 0, Parent = side })
+UI.accentize(indicator, "BackgroundColor3")
+
+local content = UI.new("Frame", {
+	Name = "Content", Position = UDim2.new(0, 160, 0, 56), Size = UDim2.new(1, -170, 1, -66),
+	BackgroundTransparency = 1, Parent = window,
+})
+
+local TABS = {
+	{ id = "Main", label = "01  MAIN", build = PageMain },
+	{ id = "Movement", label = "02  MOVEMENT", build = PageMovement },
+	{ id = "Teleport", label = "03  TELEPORT", build = PageTeleport },
+	{ id = "Builder", label = "04  BUILDER", build = PageBuilder },
+	{ id = "Player", label = "05  PLAYER", build = PagePlayer },
+	{ id = "Settings", label = "06  SETTINGS", build = PageSettings },
+}
+
+local pages, tabButtons = {}, {}
+local currentTab
+
+local function errorPage(name, err)
+	local group, scroll = UI.page(content)
+	local card = UI.card(scroll, 90)
+	UI.label(card, "<b>Erreur dans la page " .. name .. "</b>\n" .. tostring(err), {
+		Position = UDim2.new(0, 12, 0, 10), Size = UDim2.new(1, -24, 1, -20), TextColor3 = c.bad, TextSize = 12,
+	})
+	return group
+end
+
+for index, tab in ipairs(TABS) do
+	local ok, result = pcall(tab.build, ctx, content)
+	if not ok then
+		warn("[FrontHub] Page " .. tab.id .. " : " .. tostring(result))
+		result = errorPage(tab.id, result)
+	end
+	pages[tab.id] = result
+
+	local b = UI.new("TextButton", {
+		Name = tab.id, Position = UDim2.new(0, 8, 0, 8 + (index - 1) * 42), Size = UDim2.new(1, -16, 0, 36),
+		BackgroundTransparency = 1, BorderSizePixel = 0, Text = tab.label, TextColor3 = c.dim, Font = UI.font,
+		TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = false, Parent = side,
+	})
+	UI.new("UIPadding", { PaddingLeft = UDim.new(0, 12), Parent = b })
+	tabButtons[tab.id] = b
+	b.MouseEnter:Connect(function()
+		if currentTab ~= tab.id then UI.tween(b, 0.15, { TextColor3 = c.text }) end
+	end)
+	b.MouseLeave:Connect(function()
+		if currentTab ~= tab.id then UI.tween(b, 0.15, { TextColor3 = c.dim }) end
+	end)
+end
+
+local function selectTab(id)
+	if currentTab == id then return end
+	local oldPage = currentTab and pages[currentTab]
+	currentTab = id
+
+	for tabId, b in pairs(tabButtons) do
+		UI.tween(b, 0.2, { TextColor3 = (tabId == id) and UI.accent or c.dim })
+		if tabId == id then
+			UI.tween(indicator, 0.25, { Position = UDim2.new(0, 0, 0, b.Position.Y.Offset + 4) }, Enum.EasingStyle.Back)
+		end
+	end
+
+	if oldPage then
+		UI.tween(oldPage, 0.15, { GroupTransparency = 1 })
+		task.delay(UI.animations and 0.15 or 0, function()
+			if pages[currentTab] ~= oldPage then oldPage.Visible = false end
+		end)
+	end
+	local page = pages[id]
+	page.Visible = true
+	page.Position = UDim2.new(0, UI.animations and 16 or 0, 0, 0)
+	page.GroupTransparency = UI.animations and 1 or 0
+	UI.tween(page, 0.25, { GroupTransparency = 0, Position = UDim2.new(0, 0, 0, 0) })
+end
+
+for id, b in pairs(tabButtons) do
+	b.MouseButton1Click:Connect(function() selectTab(id) end)
+end
+UI.onAccent(function(color)
+	if currentTab and tabButtons[currentTab] then
+		tabButtons[currentTab].TextColor3 = color
+	end
+end)
+
+UI.label(side, "MODE : LOCAL (client)", {
+	Position = UDim2.new(0, 14, 1, -34), Size = UDim2.new(1, -28, 0, 24), TextSize = 11, TextColor3 = c.dim,
+	TextYAlignment = Enum.TextYAlignment.Center,
+})
+
+----------------------------------------------------------------------
+-- NOTIFICATIONS
+----------------------------------------------------------------------
+local toastHolder = UI.new("Frame", {
+	Name = "Toasts", AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -14, 0, 14),
+	Size = UDim2.new(0, 300, 1, -28), BackgroundTransparency = 1, Parent = gui,
+})
+UI.new("UIListLayout", {
+	Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder,
+	VerticalAlignment = Enum.VerticalAlignment.Top, Parent = toastHolder,
+})
+local toastOrder = 0
+
+function ctx.Toast(message, level)
+	if not ctx.Settings.Notifications or not message then return end
+	local color = UI.accent
+	if level == "good" then color = c.good elseif level == "bad" then color = c.bad elseif level == "warn" then color = c.warn end
+
+	local existing = {}
+	for _, child in ipairs(toastHolder:GetChildren()) do
+		if child:IsA("Frame") then existing[#existing + 1] = child end
+	end
+	if #existing >= 5 then existing[1]:Destroy() end
+
+	toastOrder += 1
+	local wrap = UI.new("Frame", {
+		Size = UDim2.new(1, 0, 0, 42), BackgroundTransparency = 1, ClipsDescendants = true,
+		LayoutOrder = toastOrder, Parent = toastHolder,
+	})
+	local card = UI.new("Frame", {
+		Position = UDim2.new(1, 30, 0, 0), Size = UDim2.new(1, 0, 1, 0),
+		BackgroundColor3 = c.panel, BorderSizePixel = 0, Parent = wrap,
+	})
+	UI.corner(card, 6)
+	UI.rawStroke(card, color, 1.2, 0.2)
+	local bar = UI.new("Frame", { Size = UDim2.new(0, 3, 1, 0), BackgroundColor3 = color, BorderSizePixel = 0, Parent = card })
+	UI.corner(bar, 2)
+	UI.label(card, tostring(message), {
+		Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(1, -18, 1, 0), TextSize = 13,
+		TextYAlignment = Enum.TextYAlignment.Center,
+	})
+	UI.tween(card, 0.25, { Position = UDim2.new(0, 0, 0, 0) }, Enum.EasingStyle.Back)
+
+	task.delay(3.2, function()
+		if wrap.Parent then
+			UI.tween(card, 0.25, { Position = UDim2.new(1, 30, 0, 0) })
+			task.wait(UI.animations and 0.27 or 0)
+			wrap:Destroy()
+		end
+	end)
+end
+
+----------------------------------------------------------------------
+-- BOUTONS DE LA FENÊTRE
+----------------------------------------------------------------------
+minBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	minBtn.Text = minimized and "+" or "-"
+	if minimized then
+		side.Visible = false
+		content.Visible = false
+	end
+	local tw = UI.tween(window, 0.25, { Size = minimized and MINI or FULL })
+	local function restore()
+		if not minimized then
+			side.Visible = true
+			content.Visible = true
+		end
+	end
+	if tw then tw.Completed:Connect(restore) else restore() end
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+	setOpen(false)
+end)
+
+-- Bouton flottant pour ouvrir / fermer (utile sur mobile)
+local launcher = UI.button(gui, "FH", {
+	Position = UDim2.new(0, 10, 0.5, -22), Size = UDim2.new(0, 44, 0, 44), TextSize = 16, Font = UI.fontTitle,
+})
+launcher.MouseButton1Click:Connect(function()
+	setOpen(not isOpen)
+end)
+
+bind(UIS.InputBegan, function(input, gpe)
+	if gpe then return end
+	if input.KeyCode == Enum.KeyCode.RightShift then
+		setOpen(not isOpen)
+	end
+end)
+
+-- Déplacement de la fenêtre (souris et tactile)
+local dragging, dragStart, startPos
+top.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = window.Position
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then dragging = false end
+		end)
+	end
+end)
+bind(UIS.InputChanged, function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		local delta = input.Position - dragStart
+		window.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+	end
+end)
+
+----------------------------------------------------------------------
+-- NETTOYAGE (relancer le script ou bouton "Supprimer le hub")
+----------------------------------------------------------------------
+local function cleanup()
+	ctx.Alive = false
+	for _, fn in ipairs(ctx.Cleanups) do
+		pcall(fn)
+	end
+	for _, cn in ipairs(conns) do
+		pcall(function() cn:Disconnect() end)
+	end
+	pcall(UI.Destroy)
+	pcall(function() gui:Destroy() end)
+	local pix = workspace:FindFirstChild("FrontHubV2_Pixels")
+	if pix then pix:Destroy() end
+	env.FrontHubV2Cleanup = nil
+end
+ctx.Destroy = cleanup
+env.FrontHubV2Cleanup = cleanup
+
+----------------------------------------------------------------------
+-- DÉMARRAGE
+----------------------------------------------------------------------
+selectTab("Main")
+setOpen(true)
+task.delay(0.6, function()
+	ctx.Toast("Bienvenue sur FRONT HUB  (RightShift = ouvrir / fermer)", "info")
+end)
